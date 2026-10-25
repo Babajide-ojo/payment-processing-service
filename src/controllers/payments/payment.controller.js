@@ -2,6 +2,8 @@ import { HttpError } from '../../common/http-error.js';
 import { createPayment, getPayment, updatePaymentStatus } from '../../services/payments/payment.service.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const referencePattern = /^pay_[0-9a-f]{16}$/;
+const idempotencyPattern = /^idem_[0-9a-f]{32}$/;
 const statuses = new Set(['pending', 'processing', 'succeeded', 'failed']);
 
 const readBody = (body) => {
@@ -12,12 +14,30 @@ const readBody = (body) => {
   return body;
 };
 
-const readPaymentId = (value) => {
-  if (typeof value !== 'string' || !uuidPattern.test(value)) {
+const readPaymentIdentifier = (value) => {
+  if (typeof value !== 'string') {
     throw new HttpError(404, 'payment_not_found', 'Payment not found');
   }
 
-  return value;
+  if (uuidPattern.test(value) || referencePattern.test(value) || idempotencyPattern.test(value)) {
+    return value;
+  }
+
+  throw new HttpError(404, 'payment_not_found', 'Payment not found');
+};
+
+const readIdempotencyKey = (request) => {
+  const key = request.get('idempotency-key');
+
+  if (key === undefined) {
+    return null;
+  }
+
+  if (!idempotencyPattern.test(key)) {
+    throw new HttpError(400, 'invalid_idempotency_key', 'Idempotency-Key must be a key generated for a payment');
+  }
+
+  return key;
 };
 
 const readAmount = (value) => {
@@ -61,6 +81,8 @@ const readStatus = (value) => {
 const toPayment = (payment) => {
   return {
     id: payment.id,
+    reference: payment.reference,
+    idempotencyKey: payment.idempotencyKey,
     amountMinor: payment.amountMinor,
     currency: payment.currency,
     customerEmail: payment.customerEmail,
@@ -72,22 +94,29 @@ const toPayment = (payment) => {
 
 export const createPaymentHandler = async (request, response) => {
   const body = readBody(request.body);
-  const payment = await createPayment({
+  const result = await createPayment({
+    idempotencyKey: readIdempotencyKey(request),
     amountMinor: readAmount(body.amountMinor),
     currency: readCurrency(body.currency),
     customerEmail: readEmail(body.customerEmail),
   });
 
-  response.status(201).json({ payment: toPayment(payment) });
+  let statusCode = 200;
+
+  if (result.created) {
+    statusCode = 201;
+  }
+
+  response.status(statusCode).json({ payment: toPayment(result.payment) });
 };
 
 export const getPaymentHandler = async (request, response) => {
-  const payment = await getPayment(readPaymentId(request.params.id));
+  const payment = await getPayment(readPaymentIdentifier(request.params.id));
   response.status(200).json({ payment: toPayment(payment) });
 };
 
 export const updatePaymentHandler = async (request, response) => {
   const body = readBody(request.body);
-  const payment = await updatePaymentStatus(readPaymentId(request.params.id), readStatus(body.status));
+  const payment = await updatePaymentStatus(readPaymentIdentifier(request.params.id), readStatus(body.status));
   response.status(200).json({ payment: toPayment(payment) });
 };

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,8 +56,39 @@ const updatePayments = (mutate) => {
   return next;
 };
 
-const findPayment = (payments, id) => {
-  return payments.find((payment) => payment.id === id);
+const findPayment = (payments, identifier) => {
+  return payments.find((payment) => {
+    return payment.id === identifier || payment.reference === identifier || payment.idempotencyKey === identifier;
+  });
+};
+
+const matchesRequest = (payment, input) => {
+  if (payment.amountMinor !== input.amountMinor) {
+    return false;
+  }
+
+  if (payment.currency !== input.currency) {
+    return false;
+  }
+
+  if (payment.customerEmail !== input.customerEmail) {
+    return false;
+  }
+
+  return true;
+};
+
+const createUniqueValue = (payments, field, prefix, size) => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const value = `${prefix}${randomBytes(size).toString('hex')}`;
+    const taken = payments.some((payment) => payment[field] === value);
+
+    if (!taken) {
+      return value;
+    }
+  }
+
+  throw new HttpError(500, 'identifier_error', 'Could not generate a unique payment identifier');
 };
 
 const setStatusWhen = async (id, fromStatus, toStatus) => {
@@ -93,24 +124,43 @@ const simulatePayment = (id) => {
 };
 
 export const createPayment = async (input) => {
-  const now = new Date().toISOString();
-  const payment = {
-    id: randomUUID(),
-    amountMinor: input.amountMinor,
-    currency: input.currency,
-    customerEmail: input.customerEmail,
-    status: 'pending',
-    createdAt: now,
-    updatedAt: now,
-  };
+  const result = await updatePayments((payments) => {
+    if (input.idempotencyKey) {
+      const existing = payments.find((payment) => payment.idempotencyKey === input.idempotencyKey);
 
-  await updatePayments((payments) => {
+      if (!existing) {
+        throw new HttpError(404, 'idempotency_key_not_found', 'Idempotency key was not found');
+      }
+
+      if (!matchesRequest(existing, input)) {
+        throw new HttpError(409, 'idempotency_conflict', 'Idempotency key was already used with a different request');
+      }
+
+      return { payment: { ...existing }, created: false };
+    }
+
+    const now = new Date().toISOString();
+    const payment = {
+      id: randomUUID(),
+      reference: createUniqueValue(payments, 'reference', 'pay_', 8),
+      idempotencyKey: createUniqueValue(payments, 'idempotencyKey', 'idem_', 16),
+      amountMinor: input.amountMinor,
+      currency: input.currency,
+      customerEmail: input.customerEmail,
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+    };
+
     payments.push(payment);
-    return payment;
+    return { payment: { ...payment }, created: true };
   });
 
-  simulatePayment(payment.id);
-  return { ...payment };
+  if (result.created) {
+    simulatePayment(result.payment.id);
+  }
+
+  return result;
 };
 
 export const getPayment = async (id) => {
