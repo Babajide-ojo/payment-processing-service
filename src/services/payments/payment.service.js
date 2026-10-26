@@ -1,14 +1,11 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { anonymousCallerId, statusMessage, statuses, terminalStatuses } from '../../common/constants.js';
 import { HttpError } from '../../common/http-error.js';
 
-const filePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../data/payments.json');
-const processingDelayMs = 400;
-const statuses = new Set(['pending', 'processing', 'succeeded', 'failed']);
-
-let writeQueue = Promise.resolve();
+const defaultFilePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../data/payments.json');
 
 const delay = (milliseconds) => {
   return new Promise((resolve) => {
@@ -16,178 +13,377 @@ const delay = (milliseconds) => {
   });
 };
 
-const readPayments = async () => {
-  try {
-    const contents = await readFile(filePath, 'utf8');
-    const parsed = JSON.parse(contents);
+const fingerprintFor = ({ amountMinor, currency, customerEmail }) => {
+  return createHash('sha256').update(`${amountMinor}|${currency}|${customerEmail}`).digest('hex');
+};
 
-    if (!Array.isArray(parsed)) {
-      throw new HttpError(500, 'storage_error', 'Payment store is invalid');
-    }
-
-    return parsed;
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return [];
-    }
-
-    throw error;
+const resolveApiKeyId = (value) => {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
   }
+
+  return anonymousCallerId;
 };
 
-const writePayments = async (payments) => {
-  const temporaryPath = `${filePath}.tmp`;
+const resolveIdempotencyKey = (value) => {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
 
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(temporaryPath, `${JSON.stringify(payments, null, 2)}\n`);
-  await rename(temporaryPath, filePath);
+  return randomUUID();
 };
 
-const updatePayments = (mutate) => {
-  const run = async () => {
-    const payments = await readPayments();
-    const result = mutate(payments);
-    await writePayments(payments);
-    return result;
+export const createPaymentService = ({
+  filePath = defaultFilePath,
+  processingDelayMs = 400,
+  runProcessing,
+} = {}) => {
+  let writeQueue = Promise.resolve();
+  let ready = false;
+  let records = [];
+  const byId = new Map();
+  const byReference = new Map();
+  const byCallerKey = new Map();
+
+  const enqueue = (task) => {
+    const run = () => {
+      return task();
+    };
+    const next = writeQueue.then(run, run);
+    writeQueue = next.then(() => undefined, () => undefined);
+    return next;
   };
 
-  const next = writeQueue.then(run, run);
-  writeQueue = next.then(() => undefined, () => undefined);
-  return next;
-};
+  const readPayments = async () => {
+    try {
+      const contents = await readFile(filePath, 'utf8');
+      const parsed = JSON.parse(contents);
 
-const findPayment = (payments, identifier) => {
-  return payments.find((payment) => {
-    return payment.id === identifier || payment.reference === identifier || payment.idempotencyKey === identifier;
-  });
-};
+      if (!Array.isArray(parsed)) {
+        throw new HttpError(500, 'storage_error', 'Payment store is invalid');
+      }
 
-const matchesRequest = (payment, input) => {
-  if (payment.amountMinor !== input.amountMinor) {
-    return false;
-  }
+      return parsed;
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return [];
+      }
 
-  if (payment.currency !== input.currency) {
-    return false;
-  }
+      if (error instanceof HttpError) {
+        throw error;
+      }
 
-  if (payment.customerEmail !== input.customerEmail) {
-    return false;
-  }
+      if (error instanceof SyntaxError) {
+        throw new HttpError(500, 'storage_error', 'Payment store is invalid');
+      }
 
-  return true;
-};
-
-const createUniqueValue = (payments, field, prefix, size) => {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const value = `${prefix}${randomBytes(size).toString('hex')}`;
-    const taken = payments.some((payment) => payment[field] === value);
-
-    if (!taken) {
-      return value;
+      throw error;
     }
-  }
+  };
 
-  throw new HttpError(500, 'identifier_error', 'Could not generate a unique payment identifier');
-};
+  const writePayments = async (payments) => {
+    const temporaryPath = `${filePath}.tmp`;
 
-const setStatusWhen = async (id, fromStatus, toStatus) => {
-  return updatePayments((payments) => {
-    const payment = findPayment(payments, id);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(temporaryPath, `${JSON.stringify(payments, null, 2)}\n`);
+    await rename(temporaryPath, filePath);
+  };
 
-    if (!payment || payment.status !== fromStatus) {
+  const remember = (payment) => {
+    byId.set(payment.id, payment);
+    byReference.set(payment.reference, payment);
+
+    let callerKeys = byCallerKey.get(payment.apiKeyId);
+
+    if (!callerKeys) {
+      callerKeys = new Map();
+      byCallerKey.set(payment.apiKeyId, callerKeys);
+    }
+
+    if (typeof payment.idempotencyKey === 'string' && payment.idempotencyKey.length > 0) {
+      callerKeys.set(payment.idempotencyKey, payment);
+    }
+  };
+
+  const rebuildIndex = () => {
+    byId.clear();
+    byReference.clear();
+    byCallerKey.clear();
+
+    for (const payment of records) {
+      remember(payment);
+    }
+  };
+
+  const ensureLoaded = async () => {
+    if (ready) {
+      return;
+    }
+
+    const stored = await readPayments();
+    const loaded = [];
+
+    for (const payment of stored) {
+      loaded.push({
+        ...payment,
+        apiKeyId: resolveApiKeyId(payment.apiKeyId),
+      });
+    }
+
+    records = loaded;
+    rebuildIndex();
+    ready = true;
+  };
+
+  const commit = async (nextRecords) => {
+    await writePayments(nextRecords);
+    records = nextRecords;
+    rebuildIndex();
+  };
+
+  const savePayment = async (updated) => {
+    const nextRecords = records.map((current) => {
+      if (current.id === updated.id) {
+        return updated;
+      }
+
+      return current;
+    });
+
+    await commit(nextRecords);
+  };
+
+  const findPayment = (identifier) => {
+    const byIdentifier = byId.get(identifier);
+
+    if (byIdentifier) {
+      return byIdentifier;
+    }
+
+    const byRef = byReference.get(identifier);
+
+    if (byRef) {
+      return byRef;
+    }
+
+    return null;
+  };
+
+  const findByIdempotency = (apiKeyId, idempotencyKey) => {
+    const callerKeys = byCallerKey.get(apiKeyId);
+
+    if (!callerKeys) {
       return null;
     }
 
-    payment.status = toStatus;
-    payment.updatedAt = new Date().toISOString();
-    return { ...payment };
-  });
-};
+    return callerKeys.get(idempotencyKey) || null;
+  };
 
-const processPayment = async (id) => {
-  await delay(processingDelayMs);
-  const processing = await setStatusWhen(id, 'pending', 'processing');
+  const createUniqueValue = (field, prefix, size) => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const value = `${prefix}${randomBytes(size).toString('hex')}`;
+      const taken = records.some((payment) => payment[field] === value);
 
-  if (!processing) {
-    return;
-  }
-
-  await delay(processingDelayMs);
-  await setStatusWhen(id, 'processing', 'succeeded');
-};
-
-const simulatePayment = (id) => {
-  processPayment(id).catch((error) => {
-    console.error('Payment processing failed', error.message);
-  });
-};
-
-export const createPayment = async (input) => {
-  const result = await updatePayments((payments) => {
-    if (input.idempotencyKey) {
-      const existing = payments.find((payment) => payment.idempotencyKey === input.idempotencyKey);
-
-      if (!existing) {
-        throw new HttpError(404, 'idempotency_key_not_found', 'Idempotency key was not found');
+      if (!taken) {
+        return value;
       }
-
-      if (!matchesRequest(existing, input)) {
-        throw new HttpError(409, 'idempotency_conflict', 'Idempotency key was already used with a different request');
-      }
-
-      return { payment: { ...existing }, created: false };
     }
 
-    const now = new Date().toISOString();
-    const payment = {
-      id: randomUUID(),
-      reference: createUniqueValue(payments, 'reference', 'pay_', 8),
-      idempotencyKey: createUniqueValue(payments, 'idempotencyKey', 'idem_', 16),
-      amountMinor: input.amountMinor,
-      currency: input.currency,
-      customerEmail: input.customerEmail,
-      status: 'pending',
-      createdAt: now,
-      updatedAt: now,
-    };
+    throw new HttpError(500, 'identifier_error', 'Could not generate a unique payment identifier');
+  };
 
-    payments.push(payment);
-    return { payment: { ...payment }, created: true };
-  });
+  const setStatusWhen = async (id, fromStatus, toStatus) => {
+    return enqueue(async () => {
+      await ensureLoaded();
+      const payment = findPayment(id);
 
-  if (result.created) {
-    simulatePayment(result.payment.id);
-  }
+      if (!payment || terminalStatuses.has(payment.status) || payment.status !== fromStatus) {
+        return null;
+      }
 
-  return result;
-};
+      const updated = {
+        ...payment,
+        status: toStatus,
+        updatedAt: new Date().toISOString(),
+      };
 
-export const getPayment = async (id) => {
-  const payments = await readPayments();
-  const payment = findPayment(payments, id);
+      await savePayment(updated);
+      return { ...updated };
+    });
+  };
 
-  if (!payment) {
-    throw new HttpError(404, 'payment_not_found', 'Payment not found');
-  }
+  const markFailed = async (id) => {
+    return enqueue(async () => {
+      await ensureLoaded();
+      const payment = findPayment(id);
 
-  return payment;
-};
+      if (!payment || terminalStatuses.has(payment.status)) {
+        return null;
+      }
 
-export const updatePaymentStatus = async (id, status) => {
-  if (!statuses.has(status)) {
-    throw new HttpError(400, 'invalid_status', 'status must be pending, processing, succeeded, or failed');
-  }
+      if (payment.status !== 'pending' && payment.status !== 'processing') {
+        return null;
+      }
 
-  return updatePayments((payments) => {
-    const payment = findPayment(payments, id);
+      const updated = {
+        ...payment,
+        status: 'failed',
+        updatedAt: new Date().toISOString(),
+      };
 
-    if (!payment) {
-      throw new HttpError(404, 'payment_not_found', 'Payment not found');
+      await savePayment(updated);
+      return { ...updated };
+    });
+  };
+
+  const builtInProcessPayment = async (id) => {
+    await delay(processingDelayMs);
+    const processing = await setStatusWhen(id, 'pending', 'processing');
+
+    if (!processing) {
+      return;
     }
 
-    payment.status = status;
-    payment.updatedAt = new Date().toISOString();
-    return { ...payment };
+    await delay(processingDelayMs);
+    await setStatusWhen(id, 'processing', 'succeeded');
+  };
+
+  const processPayment = runProcessing || builtInProcessPayment;
+
+  const simulatePayment = (id) => {
+    processPayment(id).catch(async (error) => {
+      console.error(JSON.stringify({
+        event: 'payment_processing_failed',
+        paymentId: id,
+        message: error.message,
+      }));
+
+      try {
+        await markFailed(id);
+      } catch (updateError) {
+        console.error(JSON.stringify({
+          event: 'payment_failure_not_recorded',
+          paymentId: id,
+          message: updateError.message,
+        }));
+      }
+    });
+  };
+
+  const createPayment = async (input) => {
+    const result = await enqueue(async () => {
+      await ensureLoaded();
+
+      const apiKeyId = resolveApiKeyId(input.apiKeyId);
+      const idempotencyKey = resolveIdempotencyKey(input.idempotencyKey);
+      const currency = input.currency.toUpperCase();
+      const customerEmail = input.customerEmail.trim().toLowerCase();
+      const { amountMinor } = input;
+      const fingerprint = fingerprintFor({
+        amountMinor,
+        currency,
+        customerEmail,
+      });
+      const existing = findByIdempotency(apiKeyId, idempotencyKey);
+
+      if (existing && existing.fingerprint !== fingerprint) {
+        throw new HttpError(409, 'IDEMPOTENCY_KEY_REUSED', 'Idempotency key was already used with a different request');
+      }
+
+      if (existing) {
+        return {
+          payment: { ...existing },
+          created: false,
+        };
+      }
+
+      const now = new Date().toISOString();
+      const payment = {
+        id: randomUUID(),
+        reference: createUniqueValue('reference', 'pay_', 8),
+        apiKeyId,
+        idempotencyKey,
+        fingerprint,
+        amountMinor,
+        currency,
+        customerEmail,
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await commit([...records, payment]);
+
+      return {
+        payment: { ...payment },
+        created: true,
+      };
+    });
+
+    if (result.created) {
+      simulatePayment(result.payment.id);
+    }
+
+    return result;
+  };
+
+  const getPayment = async (id) => {
+    return enqueue(async () => {
+      await ensureLoaded();
+      const payment = findPayment(id);
+
+      if (!payment) {
+        throw new HttpError(404, 'payment_not_found', 'Payment not found');
+      }
+
+      return { ...payment };
+    });
+  };
+
+  const updatePaymentStatus = async (id, status) => {
+    if (!statuses.has(status)) {
+      throw new HttpError(400, 'invalid_status', statusMessage);
+    }
+
+    return enqueue(async () => {
+      await ensureLoaded();
+      const payment = findPayment(id);
+
+      if (!payment) {
+        throw new HttpError(404, 'payment_not_found', 'Payment not found');
+      }
+
+      if (terminalStatuses.has(payment.status)) {
+        throw new HttpError(409, 'terminal_status', 'A succeeded, failed, or cancelled payment cannot be updated');
+      }
+
+      const updated = {
+        ...payment,
+        status,
+        updatedAt: new Date().toISOString(),
+      };
+
+      await savePayment(updated);
+      return { ...updated };
+    });
+  };
+
+  enqueue(() => ensureLoaded()).catch((error) => {
+    console.error(JSON.stringify({
+      event: 'payment_store_load_failed',
+      message: error.message,
+    }));
   });
+
+  return {
+    createPayment,
+    getPayment,
+    updatePaymentStatus,
+  };
 };
+
+const paymentService = createPaymentService();
+
+export const createPayment = paymentService.createPayment;
+export const getPayment = paymentService.getPayment;
+export const updatePaymentStatus = paymentService.updatePaymentStatus;

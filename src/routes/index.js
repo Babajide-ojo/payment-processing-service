@@ -1,6 +1,10 @@
 import { Router } from 'express';
-import { paymentRoutes } from './payment.routes.js';
+import { createPaymentRoutes } from './payment.routes.js';
 
-export const routes = Router();
+export const createRoutes = (service) => {
+  const routes = Router();
 
-routes.use('/payments', paymentRoutes);
+  routes.use('/payments', createPaymentRoutes(service));
+
+  return routes;
+};

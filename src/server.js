@@ -5,4 +5,5 @@ const app = createApp();
 
 app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
+  console.log(`Swagger UI at http://localhost:${port}/docs`);
 });

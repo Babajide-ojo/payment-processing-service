@@ -21,6 +21,16 @@ export const errorHandler = (error, _request, response, _next) => {
     return;
   }
 
+  if (error.type === 'entity.too.large') {
+    response.status(413).json({
+      error: {
+        code: 'payload_too_large',
+        message: 'Request body is too large',
+      },
+    });
+    return;
+  }
+
   console.error(error);
   response.status(500).json({
     error: {

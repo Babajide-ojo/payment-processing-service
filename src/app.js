@@ -1,13 +1,24 @@
 import express from 'express';
+import { mountSwagger } from './docs/swagger.js';
 import { errorHandler } from './middleware/error-handler.js';
-import { routes } from './routes/index.js';
+import { requestLogger } from './middleware/request-logger.js';
+import { createRoutes } from './routes/index.js';
+import { createPayment, getPayment, updatePaymentStatus } from './services/payments/payment.service.js';
 
-export const createApp = () => {
+const defaultService = {
+  createPayment,
+  getPayment,
+  updatePaymentStatus,
+};
+
+export const createApp = (service = defaultService) => {
   const app = express();
 
   app.disable('x-powered-by');
-  app.use(express.json());
-  app.use(routes);
+  app.use(requestLogger);
+  app.use(express.json({ limit: '100kb' }));
+  mountSwagger(app);
+  app.use(createRoutes(service));
   app.use(errorHandler);
 
   return app;
