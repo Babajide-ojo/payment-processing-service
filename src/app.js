@@ -11,14 +11,15 @@ const defaultService = {
   updatePaymentStatus,
 };
 
-export const createApp = (service = defaultService) => {
+export const createApp = (service = defaultService, options = {}) => {
+  const { apiKeyId = process.env.API_KEY_ID } = options;
   const app = express();
 
   app.disable('x-powered-by');
   app.use(requestLogger);
   app.use(express.json({ limit: '100kb' }));
   mountSwagger(app);
-  app.use(createRoutes(service));
+  app.use(createRoutes(service, apiKeyId));
   app.use(errorHandler);
 
   return app;

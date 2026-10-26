@@ -5,10 +5,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { anonymousCallerId } from '../src/common/constants.js';
 import { createApp } from '../src/app.js';
 import { idempotencyKeyPrefix } from '../src/middleware/request-logger.js';
 import { createPaymentService } from '../src/services/payments/payment.service.js';
+
+const testApiKeyId = 'test-api-key-id';
 
 const paymentBody = {
   amountMinor: 5000,
@@ -55,12 +56,18 @@ const close = (server) => {
 };
 
 const request = async (base, pathName, options = {}) => {
+  const headers = {
+    ...(options.body ? { 'content-type': 'application/json' } : {}),
+    ...(options.headers || {}),
+  };
+
+  if (options.apiKey !== false && headers['x-api-key-id'] === undefined) {
+    headers['x-api-key-id'] = testApiKeyId;
+  }
+
   const response = await fetch(`${base}${pathName}`, {
     method: options.method || 'GET',
-    headers: {
-      ...(options.body ? { 'content-type': 'application/json' } : {}),
-      ...(options.headers || {}),
-    },
+    headers,
     body: options.body,
   });
   const text = await response.text();
@@ -101,7 +108,7 @@ const start = async (serviceOptions = {}) => {
     processingDelayMs: 0,
     ...serviceOptions,
   });
-  const started = await listen(createApp(service));
+  const started = await listen(createApp(service, { apiKeyId: testApiKeyId }));
 
   return {
     ...started,
@@ -188,7 +195,7 @@ test('replays the same key and rejects a different body', async () => {
     assert.equal(again.json.payment.id, created.json.payment.id);
     assert.equal(stored.length, 1);
     assert.equal(stored[0].idempotencyKey, key);
-    assert.equal(stored[0].apiKeyId, anonymousCallerId);
+    assert.equal(stored[0].apiKeyId, testApiKeyId);
     assert.equal(stored[0].fingerprint, fingerprint(5000, 'NGN', 'ada@example.com'));
   } finally {
     await close(server);
@@ -252,44 +259,45 @@ test('creates a payment for an unknown key and rejects a malformed key', async (
   }
 });
 
-test('scopes the same idempotency key to each caller', async () => {
-  const { server, base, directory } = await start({
+test('rejects a payment request when X-Api-Key-Id does not match', async () => {
+  const { server, base, directory, filePath } = await start({
     runProcessing: async () => undefined,
   });
-  const key = 'shared-key-000001';
 
   try {
-    const first = await request(base, '/payments', {
+    const missing = await request(base, '/payments', {
       method: 'POST',
       body: JSON.stringify(paymentBody),
-      headers: {
-        'idempotency-key': key,
-        'x-api-key-id': 'client-a',
-      },
+      apiKey: false,
     });
-    const second = await request(base, '/payments', {
+    const wrong = await request(base, '/payments', {
       method: 'POST',
       body: JSON.stringify(paymentBody),
-      headers: {
-        'idempotency-key': key,
-        'x-api-key-id': 'client-b',
-      },
+      headers: { 'x-api-key-id': 'client-b' },
     });
-    const replay = await request(base, '/payments', {
+    const sameLength = await request(base, '/payments', {
       method: 'POST',
       body: JSON.stringify(paymentBody),
-      headers: {
-        'idempotency-key': key,
-        'x-api-key-id': 'client-a',
-      },
+      headers: { 'x-api-key-id': 'test-api-key-xx' },
     });
+    const created = await request(base, '/payments', {
+      method: 'POST',
+      body: JSON.stringify(paymentBody),
+    });
+    const blockedRead = await request(base, `/payments/${created.json.payment.id}`, {
+      apiKey: false,
+    });
+    const stored = JSON.parse(await readFile(filePath, 'utf8'));
 
-    assert.equal(first.status, 201);
-    assert.equal(second.status, 201);
-    assert.notEqual(first.json.payment.id, second.json.payment.id);
-    assert.equal(replay.status, 200);
-    assert.equal(replay.json.payment.id, first.json.payment.id);
-    assert.equal('idempotencyKey' in replay.json.payment, false);
+    assert.equal(missing.status, 401);
+    assert.equal(missing.json.error.code, 'invalid_api_key');
+    assert.equal(wrong.status, 401);
+    assert.equal(wrong.json.error.code, 'invalid_api_key');
+    assert.equal(sameLength.status, 401);
+    assert.equal(created.status, 201);
+    assert.equal(blockedRead.status, 401);
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].apiKeyId, testApiKeyId);
   } finally {
     await close(server);
     await rm(directory, { recursive: true, force: true });
@@ -542,7 +550,7 @@ test('returns a storage error when the payment file is unreadable', async () => 
   const filePath = path.join(directory, 'payments.json');
   await writeFile(filePath, '{');
   const service = createPaymentService({ filePath, processingDelayMs: 0 });
-  const { server, base } = await listen(createApp(service));
+  const { server, base } = await listen(createApp(service, { apiKeyId: testApiKeyId }));
 
   try {
     const brokenStore = await request(base, '/payments', {
@@ -589,7 +597,7 @@ test('reloads caller idempotency keys from the payment file', async () => {
     runProcessing: async () => undefined,
   };
   const firstService = createPaymentService(serviceOptions);
-  const first = await listen(createApp(firstService));
+  const first = await listen(createApp(firstService, { apiKeyId: testApiKeyId }));
   let secondServer = null;
 
   try {
@@ -598,7 +606,6 @@ test('reloads caller idempotency keys from the payment file', async () => {
       body: JSON.stringify(paymentBody),
       headers: {
         'idempotency-key': key,
-        'x-api-key-id': 'client-a',
       },
     });
 
@@ -606,7 +613,7 @@ test('reloads caller idempotency keys from the payment file', async () => {
     await close(first.server);
 
     const secondService = createPaymentService(serviceOptions);
-    const second = await listen(createApp(secondService));
+    const second = await listen(createApp(secondService, { apiKeyId: testApiKeyId }));
     secondServer = second.server;
 
     try {
@@ -615,7 +622,6 @@ test('reloads caller idempotency keys from the payment file', async () => {
         body: JSON.stringify(paymentBody),
         headers: {
           'idempotency-key': key,
-          'x-api-key-id': 'client-a',
         },
       });
       const otherCaller = await request(second.base, '/payments', {
@@ -631,8 +637,8 @@ test('reloads caller idempotency keys from the payment file', async () => {
       assert.equal(replay.status, 200);
       assert.equal(replay.json.payment.id, created.json.payment.id);
       assert.equal(replay.headers.get('idempotency-key'), key);
-      assert.equal(otherCaller.status, 201);
-      assert.notEqual(otherCaller.json.payment.id, created.json.payment.id);
+      assert.equal(otherCaller.status, 401);
+      assert.equal(otherCaller.json.error.code, 'invalid_api_key');
       assert.equal(fetched.status, 200);
       assert.equal(fetched.json.payment.id, created.json.payment.id);
     } finally {

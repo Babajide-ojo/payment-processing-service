@@ -11,7 +11,7 @@ npm install
 npm start
 ```
 
-The server listens on port 3000. Set `PORT` to use another port.
+The server listens on port 3000. Set `PORT` to use another port. Set `API_KEY_ID` to the value clients must send. `npm start` loads both from `.env`.
 
 ```bash
 PORT=3010 npm start
@@ -21,7 +21,7 @@ PORT=3010 npm start
 
 Swagger UI is served by the same process. Open `http://localhost:3000/docs` and use Try it out to call the endpoints. Change `3000` if you set `PORT`.
 
-The OpenAPI document is at `http://localhost:3000/openapi.json`. `POST /payments` includes the optional `Idempotency-Key` and `X-Api-Key-Id` headers.
+The OpenAPI document is at `http://localhost:3000/openapi.json`. In Swagger UI, choose Authorize and enter the `API_KEY_ID` value before calling an endpoint. `POST /payments` also accepts an optional `Idempotency-Key` header.
 
 Payments are written to `data/payments.json`. That directory is created on the first successful create.
 
@@ -33,11 +33,11 @@ Amounts are integers in minor units. `5000` with currency `NGN` is ₦50.00.
 
 `POST /payments`
 
+Every payment request must send `X-Api-Key-Id`, and the value must match the server's `API_KEY_ID`. A missing or different value returns `401` with code `invalid_api_key`. The payment is not read or written. The matching value is stored as the caller id for idempotency.
+
 Send a client-generated `Idempotency-Key` when a retry must return the original payment. The key must be 16 to 64 characters and may contain only letters, digits, `-`, and `_`. Any other value returns `400`.
 
 If you omit `Idempotency-Key`, the server generates a UUID and returns it in the `Idempotency-Key` response header. That request has no retry protection. The client did not choose the key, so a lost response cannot be retried safely, and a later create without that same key starts a new payment.
-
-`X-Api-Key-Id` scopes the key to one caller. Two callers can send the same `Idempotency-Key` and each gets their own payment. They cannot replay or see the other caller's payment through that key. If you omit `X-Api-Key-Id`, the caller id is `anonymous` and those requests share one scope.
 
 ```json
 {
@@ -93,6 +93,7 @@ Failed requests use this shape:
 | Status | When |
 | --- | --- |
 | `400` | The body, amount, currency, email, status, or idempotency key is invalid |
+| `401` | `X-Api-Key-Id` is missing or does not match `API_KEY_ID` (`invalid_api_key`) |
 | `404` | The payment does not exist |
 | `409` | The idempotency key was already used for a different request (`IDEMPOTENCY_KEY_REUSED`), or the payment is already `succeeded`, `failed`, or `cancelled` (`terminal_status`) |
 | `413` | The JSON body is larger than 100 KB |
@@ -106,4 +107,4 @@ Request logs are one JSON line per response. They include the method, path, stat
 npm test
 ```
 
-The tests start the app on a random local port and use a temporary JSON file. They cover create, background completion, background failure, idempotent replay, a reused key, caller-scoped keys, lookup by reference, status updates, error responses, and the Swagger UI.
+The tests start the app on a random local port and use a temporary JSON file. They cover create, background completion, background failure, idempotent replay, a reused key, the API key gate, lookup by reference, status updates, error responses, and the Swagger UI.

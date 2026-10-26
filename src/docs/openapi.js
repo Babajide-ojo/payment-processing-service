@@ -124,17 +124,6 @@ const idempotencyKeyParameter = {
   },
 };
 
-const apiKeyIdParameter = {
-  name: 'X-Api-Key-Id',
-  in: 'header',
-  required: false,
-  description: 'Caller id that scopes the idempotency key. Two callers can use the same key without sharing a payment. Defaults to anonymous.',
-  schema: {
-    type: 'string',
-    example: 'client-a',
-  },
-};
-
 const paymentIdParameter = {
   name: 'id',
   in: 'path',
@@ -151,11 +140,16 @@ export const openApiDocument = {
   info: {
     title: 'Payment processing',
     version: '1.0.0',
-    description: 'Create a payment, look it up by id or reference, and set its status. Amounts are integers in minor units. 5000 NGN is ₦50.00.',
+    description: 'Create a payment, look it up by id or reference, and set its status. Amounts are integers in minor units. 5000 NGN is ₦50.00. Send X-Api-Key-Id with the server API_KEY_ID value. A request that does not match is rejected before a payment is read or written.',
   },
   servers: [
     {
       url: '/',
+    },
+  ],
+  security: [
+    {
+      apiKeyId: [],
     },
   ],
   tags: [
@@ -172,7 +166,6 @@ export const openApiDocument = {
         description: 'The first use of a caller and idempotency key returns 201 and starts background processing. The same key and the same amount, currency, and email return 200 and do not start processing again. Currency is uppercased. Email is trimmed and lowercased.',
         parameters: [
           idempotencyKeyParameter,
-          apiKeyIdParameter,
         ],
         requestBody: {
           required: true,
@@ -199,6 +192,7 @@ export const openApiDocument = {
             description: 'This caller already created a payment with this key and the same amount, currency, and email.',
           },
           '400': errorResponse('The body, amount, currency, email, or idempotency key is invalid.'),
+          '401': errorResponse('X-Api-Key-Id is missing or does not match API_KEY_ID. The error code is invalid_api_key.'),
           '409': errorResponse('The idempotency key was already used for a different request. The error code is IDEMPOTENCY_KEY_REUSED.'),
           '413': errorResponse('The JSON body is larger than 100 KB.'),
           '500': errorResponse('The payment file cannot be read, or another unexpected error occurred.'),
@@ -229,6 +223,7 @@ export const openApiDocument = {
             },
           },
           '404': errorResponse('The payment does not exist, or the id is not a UUID or reference.'),
+          '401': errorResponse('X-Api-Key-Id is missing or does not match API_KEY_ID. The error code is invalid_api_key.'),
         },
       },
       patch: {
@@ -268,6 +263,7 @@ export const openApiDocument = {
             },
           },
           '400': errorResponse('The status is missing or not one of pending, processing, succeeded, failed, or cancelled.'),
+          '401': errorResponse('X-Api-Key-Id is missing or does not match API_KEY_ID. The error code is invalid_api_key.'),
           '404': errorResponse('The payment does not exist, or the id is not a UUID or reference.'),
           '409': errorResponse('The payment is already succeeded, failed, or cancelled. The error code is terminal_status.'),
         },
@@ -309,6 +305,7 @@ export const openApiDocument = {
             },
           },
           '400': errorResponse('The status is missing or not one of pending, processing, succeeded, failed, or cancelled.'),
+          '401': errorResponse('X-Api-Key-Id is missing or does not match API_KEY_ID. The error code is invalid_api_key.'),
           '404': errorResponse('The payment does not exist, or the id is not a UUID or reference.'),
           '409': errorResponse('The payment is already succeeded, failed, or cancelled. The error code is terminal_status.'),
         },
@@ -352,6 +349,14 @@ export const openApiDocument = {
       },
       Payment: paymentSchema,
       Error: errorSchema,
+    },
+    securitySchemes: {
+      apiKeyId: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Api-Key-Id',
+        description: 'Must match the API_KEY_ID environment value. Payment routes reject every other value before they read or write a payment.',
+      },
     },
   },
 };
